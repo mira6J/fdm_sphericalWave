@@ -10,9 +10,18 @@ dr = r_edges[1:] - r_edges[:-1]
 A = 4 * np.pi * r_edges**2
 V = (4/3) * np.pi * (r_edges[1:]**3 - r_edges[:-1]**3)
 
-def initial_conditions(r):
-    p = np.where(r < 0.05, 1e6, 1e5)
-    rho = np.where(r < 0.05, 5.0, 1.0)
+# -------- Initial Condition Parameters --------
+r0 = 0.05         # radius of high-pressure region [m]
+high_pressure = 1e7   # Pa
+high_density  = 20.0  # kg/m^3
+p_air = 1e5           # standard air pressure [Pa]
+rho_air = 1.0         # standard air density [kg/m^3]
+# ---------------------------------------------
+
+def initial_conditions(r, r0, high_pressure, high_density, p_air, rho_air):
+    # High pressure and density in r < r0, else standard air
+    p = np.where(r < r0, high_pressure, p_air)
+    rho = np.where(r < r0, high_density, rho_air)
     u = np.zeros_like(r)
     return rho, u, p
 
@@ -25,11 +34,17 @@ def get_primitive(U):
 def spherical_source(U, r):
     rho, u, p = get_primitive(U)
     S = np.zeros_like(U)
+    # Geometry source for momentum eqn; avoid division by zero at center
     S[:,1] = np.where(r > 1e-8, 2*p/r, 0)
     return S
 
 def apply_boundary(U):
+    # Reflective BC at r=0: velocity is zero, mirror density and energy
     U[0,1] = 0.0
+    # Optionally, for strong reflection: mirror all primitive variables at left
+    U[0,0] = U[1,0]
+    U[0,2] = U[1,2]
+    # At r=R: solid wall (copy last cell)
     U[-1,:] = U[-2,:]
     return U
 
@@ -60,33 +75,43 @@ def hllc_flux(UL, UR):
     FR[:,2] = uR*(ER + pR)
 
     flux = np.zeros_like(UL)
-    for i in range(len(UL)):
-        if SL[i] >= 0:
-            flux[i] = FL[i]
-        elif S_star[i] >= 0:
-            rho_star = rhoL[i] * (SL[i]-uL[i]) / (SL[i]-S_star[i]+1e-8)
-            mom_star = rho_star * S_star[i]
-            E_star = rho_star * (EL[i]/rhoL[i] + (S_star[i]-uL[i])*(S_star[i]+pL[i]/(rhoL[i]*(SL[i]-uL[i])+1e-8)))
-            U_star_L = np.array([rho_star, mom_star, E_star])
-            flux[i] = FL[i] + SL[i]*(U_star_L - UL[i])
-        elif SR[i] > 0:
-            rho_star = rhoR[i] * (SR[i]-uR[i]) / (SR[i]-S_star[i]+1e-8)
-            mom_star = rho_star * S_star[i]
-            E_star = rho_star * (ER[i]/rhoR[i] + (S_star[i]-uR[i])*(S_star[i]+pR[i]/(rhoR[i]*(SR[i]-uR[i])+1e-8)))
-            U_star_R = np.array([rho_star, mom_star, E_star])
-            flux[i] = FR[i] + SR[i]*(U_star_R - UR[i])
-        else:
-            flux[i] = FR[i]
+    # Vectorized implementation
+    left_mask = SL >= 0
+    star_mask = (SL < 0) & (S_star >= 0)
+    star2_mask = (S_star < 0) & (SR > 0)
+    right_mask = SR <= 0
+
+    flux[left_mask] = FL[left_mask]
+    # Star left
+    if np.any(star_mask):
+        rho_star = rhoL[star_mask] * (SL[star_mask]-uL[star_mask]) / (SL[star_mask]-S_star[star_mask]+1e-8)
+        mom_star = rho_star * S_star[star_mask]
+        E_star = rho_star * (EL[star_mask]/rhoL[star_mask] +
+                             (S_star[star_mask]-uL[star_mask]) *
+                             (S_star[star_mask] + pL[star_mask]/(rhoL[star_mask]*(SL[star_mask]-uL[star_mask])+1e-8)))
+        U_star_L = np.stack([rho_star, mom_star, E_star], axis=-1)
+        flux[star_mask] = FL[star_mask] + SL[star_mask][:, None]*(U_star_L - UL[star_mask])
+    # Star right
+    if np.any(star2_mask):
+        rho_star = rhoR[star2_mask] * (SR[star2_mask]-uR[star2_mask]) / (SR[star2_mask]-S_star[star2_mask]+1e-8)
+        mom_star = rho_star * S_star[star2_mask]
+        E_star = rho_star * (ER[star2_mask]/rhoR[star2_mask] +
+                             (S_star[star2_mask]-uR[star2_mask]) *
+                             (S_star[star2_mask] + pR[star2_mask]/(rhoR[star2_mask]*(SR[star2_mask]-uR[star2_mask])+1e-8)))
+        U_star_R = np.stack([rho_star, mom_star, E_star], axis=-1)
+        flux[star2_mask] = FR[star2_mask] + SR[star2_mask][:, None]*(U_star_R - UR[star2_mask])
+    flux[right_mask] = FR[right_mask]
     return flux
 
-rho, u, p = initial_conditions(r_centers)
+# Set up initial condition with parameters
+rho, u, p = initial_conditions(r_centers, r0, high_pressure, high_density, p_air, rho_air)
 e = p / ((gamma - 1) * rho)
 U = np.zeros((N, 3))
 U[:,0] = rho
 U[:,1] = rho * u
 U[:,2] = rho * (e + 0.5 * u**2)
 
-output_radius = [0.1, 0.5, 0.9]
+output_radius = [0.1, 0.2, 0.3, 0.4, 0.5]
 pressure_history = {radius: [] for radius in output_radius}
 
 T_end = 0.001
@@ -114,11 +139,12 @@ while t < T_end:
         dt = T_end - t
     dt_list.append(dt)
 
-    U_new = U.copy()
-    for i in range(N):
-        F_R = F_edge[i+1]
-        F_L = F_edge[i]
-        U_new[i] += -dt / V[i] * (A[i+1]*F_R - A[i]*F_L) + spherical_source(U[i:i+1], r_centers[i])[0] * dt
+    # vectorized update
+    F_R = F_edge[1:]
+    F_L = F_edge[:-1]
+    source = spherical_source(U, r_centers)
+    U_new = U + (-dt / V[:, None]) * (A[1:, None]*F_R - A[:-1, None]*F_L) + source * dt
+
     U_new = apply_boundary(U_new)
     U_new[:,0] = np.clip(U_new[:,0], 1e-8, 1e8)
     U_new[:,2] = np.clip(U_new[:,2], 1e-8, 1e12)
@@ -140,6 +166,7 @@ plt.ylabel('Pressure [MPa]')
 plt.title('Pressure Distribution at t = {:.3f} ms'.format(t*1e3))
 plt.grid()
 plt.tight_layout()
+plt.savefig(f'Pressure_distribution.png')
 plt.show()
 
 # Plot density vs radius
@@ -150,6 +177,7 @@ plt.ylabel('Density [kg/m³]')
 plt.title('Density Distribution at t = {:.3f} ms'.format(t*1e3))
 plt.grid()
 plt.tight_layout()
+plt.savefig(f'Density_distribution.png')
 plt.show()
 
 # Plot pressure history (in MPa) at selected radii, time in ms
@@ -163,4 +191,5 @@ plt.legend()
 plt.title('Pressure History at Selected Radii')
 plt.grid()
 plt.tight_layout()
+plt.savefig(f'Pressure_history.png')
 plt.show()
